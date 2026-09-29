@@ -33,7 +33,10 @@ FILES = {
     "inventory": DATA_DIR / "app_inventory_policy.parquet",
     "regime_trajectories": DATA_DIR / "app_regime_trajectories.parquet",
     "regime_actuals": DATA_DIR / "app_regime_actuals.parquet",
+    # Optional: weekly historical demand for Intermittent / Lumpy SKUs (the daily history artifact covers Smooth / Erratic).
+    "regime_history": DATA_DIR / "app_regime_history.parquet",
 }
+OPTIONAL_FILES = {"regime_history"}
 
 CHART_FONT = "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
 
@@ -91,7 +94,19 @@ def find_col_like(columns, candidates):
     raise KeyError(f"Could not find one of {candidates} " f"in {list(columns)}")
 
 
+def to_ns(values):
+    """Normalize any datetime resolution (s/ms/us/ns) to datetime64[ns].
+
+    Parquet files written by different pandas/pyarrow versions carry different
+    datetime units, and pandas 2.x treats them as unequal.
+    """
+    return pd.to_datetime(values).astype("datetime64[ns]")
+
+
 def safe_str_series(series):
+    # Categorical columns cannot be filled with a value outside their categories.
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        series = series.astype(object)
     return series.fillna("").astype(str)
 
 
@@ -159,7 +174,7 @@ def _id_column_from_parquet(path):
 
 
 def required_files_present():
-    return all(path.exists() for path in FILES.values())
+    return all(path.exists() for key, path in FILES.items() if key not in OPTIONAL_FILES)
 
 
 # ============================================================
@@ -197,7 +212,7 @@ def load_sku_rows(kind, sku):
     date_col = find_col(df, ["date"], required=True)
     if date_col != "date":
         df = df.rename(columns={date_col: "date"})
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = to_ns(df["date"])
     return df.sort_values("date").reset_index(drop=True)
 
 
@@ -216,7 +231,7 @@ def load_regime_trajectory(sku):
     path = FILES["regime_trajectories"]
     id_col = _id_column_from_parquet(path)
     df = pd.read_parquet(path, filters=[(id_col, "==", str(sku))])
-    df["period"] = pd.to_datetime(df["period"])
+    df["period"] = to_ns(df["period"])
     return df.sort_values("period").reset_index(drop=True)
 
 
@@ -229,7 +244,22 @@ def load_regime_actuals(sku):
     path = FILES["regime_actuals"]
     id_col = _id_column_from_parquet(path)
     df = pd.read_parquet(path, filters=[(id_col, "==", str(sku))])
-    df["period"] = pd.to_datetime(df["period"])
+    df["period"] = to_ns(df["period"])
+    return df.sort_values("period").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_regime_history(sku):
+    """
+    Frozen weekly historical demand for one Intermittent or Lumpy SKU.
+    Returns an empty frame if the optional artifact is not present.
+    """
+    path = FILES["regime_history"]
+    if not path.exists():
+        return pd.DataFrame()
+    id_col = _id_column_from_parquet(path)
+    df = pd.read_parquet(path, filters=[(id_col, "==", str(sku))])
+    df["period"] = to_ns(df["period"])
     return df.sort_values("period").reset_index(drop=True)
 
 
@@ -253,7 +283,7 @@ def _read_pooled_frame(kind, value_aliases, value_name, sku_index, date_aliases=
     out = pd.DataFrame(
         {
             "sku": np.where(codes >= 0, lookup[codes], -1),
-            "date": pd.to_datetime(df[date_name]),
+            "date": to_ns(df[date_name]),
             value_name: pd.to_numeric(df[value_source], errors="coerce"),
         }
     )
@@ -427,9 +457,9 @@ def validate_forecast_data(forecasts, actuals):
         return
     if "date" not in forecasts.columns:
         raise ValueError("Forecast artifact has no date column.")
-    forecast_dates = pd.DatetimeIndex(forecasts["date"]).sort_values()
-    actual_dates = pd.DatetimeIndex(actuals["date"]).sort_values()
-    if not actual_dates.empty and not forecast_dates.equals(actual_dates):
+    forecast_dates = pd.DatetimeIndex(to_ns(forecasts["date"])).sort_values()
+    actual_dates = pd.DatetimeIndex(to_ns(actuals["date"])).sort_values()
+    if not actual_dates.empty and not np.array_equal(forecast_dates.asi8, actual_dates.asi8):
         raise ValueError("Frozen forecast and actual " "dates do not align.")
     if forecast_dates.min() != FORECAST_START or forecast_dates.max() != FORECAST_END:
         raise ValueError("Unexpected frozen forecast " "date range: " f"{forecast_dates.min():%Y-%m-%d} " "to " f"{forecast_dates.max():%Y-%m-%d}.")
@@ -442,6 +472,14 @@ def validate_regime_trajectory(trajectory):
         raise ValueError("Regime trajectory artifact is missing period/forecast columns.")
     if trajectory["period"].min() != FORECAST_START:
         raise ValueError(f"Unexpected frozen trajectory start: {trajectory['period'].min():%Y-%m-%d} " f"(expected {FORECAST_START:%Y-%m-%d}).")
+
+
+def validate_regime_history(history):
+    if history.empty:
+        return
+    periods = pd.DatetimeIndex(history["date"])
+    if periods.min() < HISTORY_START or periods.max() + pd.Timedelta(days=6) > HISTORY_END:
+        raise ValueError("Regime history periods fall outside the historical window or include an incomplete week.")
 
 
 def validate_regime_actuals(actuals):
@@ -1340,7 +1378,13 @@ if regime_requires_weekly:
     # Intermittent / Lumpy: frozen weekly actuals + weekly trajectory (never interpolated to daily).
     # Weekly period is exposed as `date` so the shared chart/metric code can reuse it.
     actuals = load_regime_actuals(selected_sku).rename(columns={"period": "date"})
-    validate_actual_history(actuals, history)
+    regime_history = load_regime_history(selected_sku)
+    if not regime_history.empty:
+        history = regime_history.rename(columns={"period": "date"})
+        validate_regime_history(history)
+        validate_actual_history(actuals, pd.DataFrame())
+    else:
+        validate_actual_history(actuals, history)
     validate_regime_actuals(actuals)
     trajectory = load_regime_trajectory(selected_sku)
     has_forecast = not trajectory.empty
