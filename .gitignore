@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.env
+.ipynb_checkpoints/
+
+# Raw / working M5 data
+data/raw/
+data/interim/
+
+# Local logs / scratch output
+*.log
